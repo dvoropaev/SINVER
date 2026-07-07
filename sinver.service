@@ -1,0 +1,12 @@
+[Unit]
+Description=SINVER local inventory web app
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sinver /var/sinver/sinver.sqlite
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
