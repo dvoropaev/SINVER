@@ -1,6 +1,8 @@
 
 Made possible by [VPN-TIME](https://vtime.pro/) — a pay-as-you-go VPN service.
 
+![Список серверов в SINVER](doc/main.png)
+
 # Что такое SINVER?
 
 Это простое веб-приложение для инвентаризации серверов и управления DNS-записями.
