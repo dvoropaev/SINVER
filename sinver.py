@@ -1065,7 +1065,18 @@ def create_app(db_path: Path, debug_mode: bool = False) -> Flask:
             params.append(f"%{description}%")
 
         where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
-        rows = q(f"SELECT * FROM hostings{where} ORDER BY {order} COLLATE NOCASE", params)
+        rows = q(
+            f"""
+            SELECT h.*, (
+                SELECT COUNT(*)
+                FROM servers s
+                WHERE s.hosting_id = h.id
+            ) AS server_count
+            FROM hostings h{where}
+            ORDER BY {order} COLLATE NOCASE
+            """,
+            params,
+        )
 
         body = render_template_string(
             """
@@ -1079,8 +1090,8 @@ def create_app(db_path: Path, debug_mode: bool = False) -> Flask:
                 <div class="actions"><button class="btn primary">Apply</button><a href="{{ url_for('hostings') }}" class="btn">Reset</a></div>
               </form>
             </div>
-            <div class="panel"><table><thead><tr><th>Name</th><th>URL</th><th>Paid until</th><th>Description</th></tr></thead><tbody>
-            {% for row in rows %}<tr title="{{ short(row['description']) }}"><td><a href="{{ url_for('hosting_detail', hosting_id=row.id) }}">{{ row.name }}</a></td><td>{% if row.url %}<a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.url }}</a>{% else %}—{% endif %}</td><td>{{ row.paid_until or '—' }}</td><td>{{ short(row.description) or '—' }}</td></tr>{% endfor %}
+            <div class="panel"><table><thead><tr><th>Name</th><th>URL</th><th>Количество серверов</th><th>Paid until</th><th>Description</th></tr></thead><tbody>
+            {% for row in rows %}<tr title="{{ short(row['description']) }}"><td><a href="{{ url_for('hosting_detail', hosting_id=row.id) }}">{{ row.name }}</a></td><td>{% if row.url %}<a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.url }}</a>{% else %}—{% endif %}</td><td>{{ row.server_count }}</td><td>{{ row.paid_until or '—' }}</td><td>{{ short(row.description) or '—' }}</td></tr>{% endfor %}
             </tbody></table></div>
             <div class="panel"><h2>Add hosting</h2><form method="post" action="{{ url_for('hosting_create') }}" class="grid">
               <div><label>Name</label><input required name="name"></div><div><label>URL</label><input name="url" type="url"></div><div><label>Paid until</label><input name="paid_until" type="date"></div>
