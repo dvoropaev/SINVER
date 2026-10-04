@@ -12,11 +12,13 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import ipaddress
+import logging
 import secrets
+import shutil
 import sqlite3
 import sys
+import tomllib
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -37,7 +39,9 @@ except Exception:  # noqa: BLE001
 BASE_DIR = Path(__file__).resolve().parent
 INIT_SQL_PATH = BASE_DIR / "init_db.sql"
 INSTALL_INIT_SQL_PATH = Path("/usr/share/sinver/init_db.sql")
-DEFAULT_PORT = 5173
+DEFAULT_CONFIG_PATH = Path("/etc/sinver.toml")
+DEFAULT_HTTP_ADDR = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8080
 MAX_TOOLTIP_LEN = 50
 RECORD_TYPES = ("A", "AAAA", "SOA")
 POWERDNS_SYNC_RECORD_TYPES = frozenset(RECORD_TYPES)
@@ -166,6 +170,60 @@ class ZoneRecord:
     ttl: int = 3600
 
 
+@dataclass(frozen=True)
+class SinverConfig:
+    database_path: Path
+    database_backup_path: Path
+    log_file: Path
+    http_addr: str = DEFAULT_HTTP_ADDR
+    http_port: int = DEFAULT_HTTP_PORT
+
+
+def load_config(config_path: Path) -> SinverConfig:
+    """Загружает и проверяет конфигурацию SINVER из TOML-файла."""
+    try:
+        with config_path.open("rb") as config_file:
+            values = tomllib.load(config_file)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"cannot read config {config_path}: {exc}") from exc
+
+    required = ("database_path", "database_backup_path", "log_file")
+    missing = [key for key in required if not isinstance(values.get(key), str) or not values[key].strip()]
+    if missing:
+        raise ValueError(f"missing or invalid config values: {', '.join(missing)}")
+
+    http_addr = values.get("http_addr", DEFAULT_HTTP_ADDR)
+    http_port = values.get("http_port", DEFAULT_HTTP_PORT)
+    if not isinstance(http_addr, str) or not http_addr.strip():
+        raise ValueError("http_addr must be a non-empty string")
+    if not isinstance(http_port, int) or isinstance(http_port, bool) or not 1 <= http_port <= 65535:
+        raise ValueError("http_port must be an integer between 1 and 65535")
+
+    base_dir = config_path.resolve().parent
+
+    def resolve_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else base_dir / path
+
+    return SinverConfig(
+        database_path=resolve_path(values["database_path"]),
+        database_backup_path=resolve_path(values["database_backup_path"]),
+        log_file=resolve_path(values["log_file"]),
+        http_addr=http_addr,
+        http_port=http_port,
+    )
+
+
+def configure_logging(log_file: Path) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_file, encoding="utf-8")],
+        force=True,
+    )
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -188,7 +246,7 @@ def format_sql_preview(value: str) -> str:
 
 
 def log_powerdns(step: int, message: str) -> None:
-    print(f"[PowerDNS][Step {step}] {message}", flush=True)
+    logging.getLogger("sinver.powerdns").info("[Step %s] %s", step, message)
 
 
 def _pg_options_string() -> str:
@@ -219,10 +277,11 @@ def pg_connect_from_zone(zone: sqlite3.Row, *, with_timeouts: bool) -> Any:
     return psycopg2.connect(**kwargs)
 
 
-def create_app(db_path: Path, debug_mode: bool = False) -> Flask:
+def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool = False) -> Flask:
     app = Flask(__name__)
     app.secret_key = secrets.token_hex(24)
     app.config["DATABASE"] = str(db_path)
+    app.config["DATABASE_BACKUP_PATH"] = str(backup_path or db_path.parent)
     app.config["DEBUG_MODE"] = debug_mode
     app.config["POWERDNS_PLAN_CACHE"] = {}
     app.config["POWERDNS_PLAN_TTL_SECONDS"] = 600
@@ -250,8 +309,10 @@ def create_app(db_path: Path, debug_mode: bool = False) -> Flask:
 
     def backup_database_before_change() -> Path:
         source_path = Path(app.config["DATABASE"]).resolve()
+        backup_dir = Path(app.config["DATABASE_BACKUP_PATH"]).resolve()
+        backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        backup_path = source_path.with_name(f"{source_path.name}.{timestamp}.bak")
+        backup_path = backup_dir / f"{source_path.name}.{timestamp}.bak"
         shutil.copy2(source_path, backup_path)
         return backup_path
 
@@ -1638,10 +1699,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="sinver.py",
         description="SINVER — локальный веб-интерфейс для инвентаризации серверов и DNS.",
-        epilog="Пример запуска: ./sinver.py ./db.sqlite --port 5173 --debug",
+        epilog="Пример запуска: ./sinver.py --config ./sinver.toml --debug",
     )
-    parser.add_argument("db", type=Path, help="Путь к SQLite базе")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP порт (по умолчанию {DEFAULT_PORT})")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help=f"Путь к TOML-конфигу (по умолчанию {DEFAULT_CONFIG_PATH})")
     parser.add_argument("--debug", action="store_true", help="Режим отладки: подробные ошибки в веб-интерфейсе")
     parser.add_argument("--init-if-missing", action="store_true", help="Автоматически создать БД без вопроса")
     return parser.parse_args(argv)
@@ -1654,7 +1714,17 @@ def ask_create_db(path: Path) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
-    db_path: Path = args.db
+    try:
+        config = load_config(args.config)
+        configure_logging(config.log_file)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: cannot configure logging: {exc}", file=sys.stderr)
+        return 1
+
+    db_path = config.database_path
     init_sql_path = resolve_init_sql_path()
 
     if init_sql_path is None:
@@ -1680,9 +1750,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: database validation failed: {reason}", file=sys.stderr)
         return 1
 
-    app = create_app(db_path, debug_mode=args.debug)
-    print(f"SINVER started successfully: http://127.0.0.1:{args.port}")
-    app.run(host="127.0.0.1", port=args.port, debug=False)
+    app = create_app(db_path, config.database_backup_path, debug_mode=args.debug)
+    logging.getLogger("sinver").info("SINVER started successfully: http://%s:%s", config.http_addr, config.http_port)
+    app.run(host=config.http_addr, port=config.http_port, debug=False)
     return 0
 
 
