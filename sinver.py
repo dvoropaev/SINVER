@@ -43,8 +43,8 @@ DEFAULT_CONFIG_PATH = Path("/etc/sinver.toml")
 DEFAULT_HTTP_ADDR = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8080
 MAX_TOOLTIP_LEN = 50
-RECORD_TYPES = ("A", "AAAA", "SOA")
-POWERDNS_SYNC_RECORD_TYPES = frozenset(RECORD_TYPES)
+SUBDOMAIN_RECORD_TYPES = ("A", "AAAA")
+POWERDNS_SYNC_RECORD_TYPES = frozenset((*SUBDOMAIN_RECORD_TYPES, "SOA"))
 
 # PostgreSQL session timeouts (ms)
 PG_STATEMENT_TIMEOUT_MS = 30_000
@@ -445,7 +445,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
                 records.append(ZoneRecord(f"{s['hostname']}.{s['zone']}", "A" if s["ip_type"] == "IPv4" else "AAAA", s["ip"]))
 
         for sd in q("SELECT * FROM subdomains WHERE zone_id=?", (zone_id,)):
-            if sd["record_type"] not in POWERDNS_SYNC_RECORD_TYPES:
+            if sd["record_type"] not in SUBDOMAIN_RECORD_TYPES:
                 continue
             fqdn = resolve_subdomain_fqdn(sd["subdomain"], zone["zone"])
             mapped_ips = q(
@@ -457,13 +457,9 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
                 """,
                 (sd["id"],),
             )
-            if sd["record_type"] in {"A", "AAAA"}:
-                for item in mapped_ips:
-                    if (sd["record_type"] == "A" and item["ip_type"] == "IPv4") or (sd["record_type"] == "AAAA" and item["ip_type"] == "IPv6"):
-                        records.append(ZoneRecord(fqdn, sd["record_type"], item["ip"]))
-            elif mapped_ips:
-                # Для SOA в поддоменах оставляем прежнее поведение совместимости.
-                records.append(ZoneRecord(fqdn, sd["record_type"], mapped_ips[0]["ip"]))
+            for item in mapped_ips:
+                if (sd["record_type"] == "A" and item["ip_type"] == "IPv4") or (sd["record_type"] == "AAAA" and item["ip_type"] == "IPv6"):
+                    records.append(ZoneRecord(fqdn, sd["record_type"], item["ip"]))
 
         return sorted(records, key=lambda r: (r.fqdn, r.record_type, r.content))
 
@@ -870,6 +866,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
         body = render_template_string(
             """
             <div class="panel"><h1>Subdomains</h1>
+              <p class="muted">Only A and AAAA are supported. SOA parameters are configured on the Zones tab.</p>
               <form method="get" class="grid">
                 <div><label>Type</label><select name="record_type"><option value="">Any</option>{% for rt in record_types %}<option value="{{ rt }}" {% if request.args.get('record_type') == rt %}selected{% endif %}>{{ rt }}</option>{% endfor %}</select></div>
                 <div><label>Zone</label><select name="zone_id"><option value="">Any</option>{% for z in zones %}<option value="{{ z.id }}" {% if request.args.get('zone_id') == z.id|string %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
@@ -894,7 +891,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             rows=rows,
             zones=q("SELECT id, zone FROM zones ORDER BY zone"),
             roles=q("SELECT id, role_name FROM roles ORDER BY role_name"),
-            record_types=RECORD_TYPES,
+            record_types=SUBDOMAIN_RECORD_TYPES,
             sd_colors={int(row["id"]): resolve_subdomain_color(row) for row in rows},
             request=request,
         )
@@ -903,7 +900,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
     @app.post("/subdomains/create")
     def subdomain_create() -> Response:
         record_type = request.form["record_type"]
-        if record_type not in RECORD_TYPES:
+        if record_type not in SUBDOMAIN_RECORD_TYPES:
             flash("Unsupported record type.", "bad")
             return redirect(url_for("subdomains"))
 
@@ -923,7 +920,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
     def subdomain_detail(subdomain_id: int) -> str | Response:
         if request.method == "POST":
             record_type = request.form["record_type"]
-            if record_type not in RECORD_TYPES:
+            if record_type not in SUBDOMAIN_RECORD_TYPES:
                 flash("Unsupported record type.", "bad")
                 return redirect(url_for("subdomain_detail", subdomain_id=subdomain_id))
 
@@ -982,7 +979,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             <div class="panel"><form method="post" action="{{ url_for('subdomain_delete', subdomain_id=row.id) }}" onsubmit="return confirm('Delete subdomain?')"><button class="btn danger">Delete subdomain</button></form></div>
             """,
             row=row,
-            record_types=RECORD_TYPES,
+            record_types=SUBDOMAIN_RECORD_TYPES,
             zones=q("SELECT id, zone FROM zones ORDER BY zone"),
             roles=q("SELECT id, role_name FROM roles ORDER BY role_name"),
             ips=q("SELECT id, ip FROM ip_addresses ORDER BY ip"),
