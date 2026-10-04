@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/sinver /var/sinver/sinver.sqlite
+ExecStart=/usr/bin/sinver --config /etc/sinver.toml
 Restart=on-failure
 RestartSec=5
 

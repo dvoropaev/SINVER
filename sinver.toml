@@ -1,0 +1,5 @@
+database_path = "/var/sinver/sinver.sqlite"
+database_backup_path = "/var/sinver/backups"
+http_addr = "127.0.0.1"
+http_port = 8080
+log_file = "/var/log/sinver/sinver.log"
