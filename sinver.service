@@ -4,6 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
+User=sinver
+Group=sinver
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
 ExecStart=/usr/bin/sinver --config /etc/sinver.toml
 Restart=on-failure
 RestartSec=5
