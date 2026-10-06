@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import logging
+import re
+import threading
 import secrets
 import shutil
 import sqlite3
@@ -37,7 +39,11 @@ except Exception:  # noqa: BLE001
 
 
 BASE_DIR = Path(__file__).resolve().parent
-INIT_SQL_PATH = BASE_DIR / "init_db.sql"
+SINVER_VERSION = "0.0.0"
+MIN_SUPPORTED_DATABASE_VERSION = "0.0.0"
+INIT_SQL_PATH = BASE_DIR / "database" / "init_db.sql"
+MIGRATIONS_PATH = BASE_DIR / "database" / "migrations"
+INSTALL_MIGRATIONS_PATH = Path("/usr/share/sinver/migrations")
 INSTALL_INIT_SQL_PATH = Path("/usr/share/sinver/init_db.sql")
 DEFAULT_CONFIG_PATH = Path("/etc/sinver.toml")
 DEFAULT_HTTP_ADDR = "127.0.0.1"
@@ -1692,6 +1698,211 @@ def validate_database(db_path: Path) -> tuple[bool, str]:
     return True, "OK"
 
 
+def semver(value: str) -> tuple[int, int, int]:
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value):
+        raise ValueError(f"Invalid database version: {value!r}")
+    return tuple(map(int, value.split('.')))
+
+
+class DatabaseMaintenance:
+    """Bootstrap independent of inventory tables; no database is opened by the UI."""
+
+    def __init__(self, database: Path, backups: Path):
+        self.database = database
+        self.backups = backups
+        self.ready = False
+        self.version: str | None = None
+        self.error = ""
+        self.steps: list[tuple[str, Path | None]] = []
+        self.lock = threading.Lock()
+        self.token = secrets.token_urlsafe(32)
+        self.backup: Path | None = None
+
+    def report(self, message: str) -> None:
+        logging.getLogger("sinver.maintenance").info(message)
+        print(message, flush=True)
+
+    def connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.database.resolve().as_uri() + "?mode=rw", uri=True)
+
+    def validate(self, conn: sqlite3.Connection) -> None:
+        if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise ValueError("SQLite integrity_check failed")
+        if conn.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("SQLite foreign_key_check failed")
+        schema = resolve_init_sql_path()
+        if schema is None:
+            raise ValueError("Current SQLite schema not found")
+        with closing(sqlite3.connect(":memory:")) as expected:
+            expected.executescript(schema.read_text(encoding="utf-8"))
+            for name, sql in expected.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'"):
+                actual = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+                if not actual:
+                    raise ValueError(f"Missing table: {name}")
+                columns = {r[1]: r[2:] for r in conn.execute(f'PRAGMA table_info("{name}")')}
+                for row in expected.execute(f'PRAGMA table_info("{name}")'):
+                    if columns.get(row[1]) != row[2:]:
+                        raise ValueError(f"Invalid column: {name}.{row[1]}")
+                # Compare constraints as declared by the current schema, ignoring whitespace.
+                normalize = lambda text: re.sub(r'\s+', '', text.lower()).replace('ifnotexists', '')
+                if normalize(actual[0]) != normalize(sql):
+                    raise ValueError(f"Invalid constraints: {name}")
+            for name, sql in expected.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"):
+                actual = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+                if not actual or normalize(actual[0]) != normalize(sql):
+                    raise ValueError(f"Missing or invalid index: {name}")
+        row = conn.execute("SELECT value FROM sinver_meta WHERE key='database_version'").fetchone()
+        if row != (SINVER_VERSION,):
+            raise ValueError("Database version does not match SINVER")
+        self.report("Post-migration validation: OK")
+
+    def prepare(self) -> None:
+        try:
+            self.report(f"SINVER version: {SINVER_VERSION}")
+            if not self.database.exists():
+                self.report("Maintenance mode: creating database")
+                schema = resolve_init_sql_path()
+                if schema is None:
+                    raise ValueError("Current SQLite schema not found")
+                self.database.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.database.with_name(self.database.name + '.bootstrap-' + secrets.token_hex(8))
+                try:
+                    init_database(temporary, schema)
+                    with closing(sqlite3.connect(temporary)) as conn:
+                        self.validate(conn)
+                    temporary.replace(self.database)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            with closing(self.connect()) as conn:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if 'sinver_meta' not in tables:
+                    self.version = '0.0.0'
+                    self.steps = [('bootstrap_metadata', None)]
+                else:
+                    row = conn.execute("SELECT value FROM sinver_meta WHERE key='database_version'").fetchone()
+                    if row is None:
+                        raise ValueError("Database version is missing")
+                    self.version = row[0]
+                self.report(f"Database version: {self.version}; target: {SINVER_VERSION}")
+                if semver(self.version) > semver(SINVER_VERSION):
+                    raise ValueError(f"Установите SINVER {self.version} или новее либо восстановите старую резервную копию.")
+                if semver(self.version) < semver(MIN_SUPPORTED_DATABASE_VERSION):
+                    raise ValueError(f"Unsupported upgrade path: install an intermediate SINVER release (minimum DB {MIN_SUPPORTED_DATABASE_VERSION})")
+                migrations = MIGRATIONS_PATH if MIGRATIONS_PATH.is_dir() else INSTALL_MIGRATIONS_PATH
+                if not migrations.is_dir():
+                    raise ValueError("Migration directory is missing; upgrade path cannot be verified")
+                ids = set()
+                for release in sorted(migrations.iterdir(), key=lambda p: semver(p.name) if p.is_dir() else (-1, -1, -1)):
+                    if not release.is_dir():
+                        continue
+                    if semver(self.version) < semver(release.name) <= semver(SINVER_VERSION):
+                        for step in sorted(release.iterdir()):
+                            if step.suffix != '.sql':
+                                raise ValueError(f"Unsupported migration step: {step.name}")
+                            if step.stem in ids:
+                                raise ValueError(f"Duplicate migration ID: {step.stem}")
+                            ids.add(step.stem)
+                            self.steps.append((step.stem, step))
+                self.report("Upgrade path: " + ', '.join(i for i, _ in self.steps or [('version_sync', None)]))
+                if self.steps:
+                    self.backup = self.backups / f"sinver-db-{self.version}-{utc_now():%Y-%m-%d_%H-%M-%S_%f}.sqlite3"
+                    self.report(f"Требуется миграция схемы БД: {self.version} -> {SINVER_VERSION}; требуется подтверждение в Web UI")
+                    return
+                if self.version != SINVER_VERSION:
+                    with conn:
+                        self.history(conn, None, 'version_sync')
+                        conn.execute("UPDATE sinver_meta SET value=? WHERE key='database_version'", (SINVER_VERSION,))
+                        self.validate(conn)
+                else:
+                    self.validate(conn)
+            self.ready = True
+            self.report("database ready")
+        except Exception as exc:
+            self.error = str(exc)
+            self.report(f"Maintenance error: {exc}")
+
+    def history(self, conn: sqlite3.Connection, migration_id: str | None, kind: str) -> None:
+        now = utc_now().isoformat()
+        conn.execute("INSERT INTO migration_history(from_version,to_version,migration_id,migration_type,started_at,finished_at,status) VALUES (?,?,?,?,?,?,'success')",
+                     (self.version, SINVER_VERSION, migration_id, kind, now, now))
+
+    def migrate(self) -> None:
+        with self.lock:
+            if self.ready or self.error or not self.steps:
+                return
+            backup_complete = False
+            try:
+                self.backups.mkdir(parents=True, exist_ok=True)
+                if self.backup is None:
+                    raise ValueError("Backup path was not prepared")
+                self.report(f"Creating backup: {self.backup}")
+                with closing(self.connect()) as source, closing(sqlite3.connect(self.backup)) as destination:
+                    source.backup(destination)
+                    if destination.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                        raise ValueError('Backup integrity check failed')
+                backup_complete = True
+                self.report("Backup successful")
+                with closing(self.connect()) as conn:
+                    for migration_id, path in self.steps:
+                        self.report(f"Migration step started: {migration_id}")
+                        if path is None:
+                            schema = resolve_init_sql_path()
+                            if schema is None:
+                                raise ValueError('Current SQLite schema not found')
+                            # Only service tables are added to an unversioned 0.0.0 database.
+                            sql = schema.read_text(encoding='utf-8').split('-- Таблица зон DNS.')[0]
+                            conn.executescript(sql + '\nCOMMIT;')
+                        else:
+                            conn.executescript(path.read_text(encoding='utf-8'))
+                        with conn:
+                            self.history(conn, migration_id, 'migration')
+                        self.report(f"Migration step successful: {migration_id}")
+                    with conn:
+                        conn.execute("UPDATE sinver_meta SET value=? WHERE key='database_version'", (SINVER_VERSION,))
+                    self.validate(conn)
+                self.version = SINVER_VERSION
+                self.ready = True
+                self.report("Migration successful; database ready")
+            except Exception as exc:
+                self.error = f"Migration {migration_id if backup_complete else 'backup'} failed: {exc}"
+                self.report(self.error)
+                if backup_complete:
+                    try:
+                        with closing(sqlite3.connect(self.backup)) as source, closing(self.connect()) as destination:
+                            source.backup(destination)
+                        self.report(f"Database restored from backup: {self.backup}")
+                    except Exception as restore_error:
+                        self.error += f"; restore failed: {restore_error}"
+                        self.report(self.error)
+
+
+def install_maintenance_gate(app: Flask, maintenance: DatabaseMaintenance) -> None:
+    def gate() -> Response | tuple[str, int] | None:
+        if maintenance.ready:
+            return None
+        if request.method == 'POST' and request.path == '/maintenance/confirm':
+            if not secrets.compare_digest(request.form.get('token', ''), maintenance.token):
+                return Response('Invalid confirmation token', status=403)
+            maintenance.migrate()
+            if maintenance.ready:
+                return redirect('/')
+        backups = sorted(maintenance.backups.glob('sinver-db-*.sqlite3')) if maintenance.backups.is_dir() else []
+        return render_template_string('''<!doctype html><html lang="ru"><meta charset="utf-8">
+<title>SINVER Maintenance</title><h1>SINVER — Maintenance mode</h1>
+<p>Версия БД: {{ state.version or 'неизвестна' }}. Версия SINVER: {{ target }}.</p>
+{% if state.error %}<p role="alert">{{ state.error }}</p>{% endif %}
+{% if state.steps and not state.error %}<p>Перед миграцией будет создана резервная копия: {{ state.backup }}.</p>
+<p>План: {% for id, path in state.steps %}{{ id }} {% endfor %}</p>
+<form method="post" action="/maintenance/confirm"><input type="hidden" name="token" value="{{ state.token }}">
+<button>Подтвердить миграцию и создание резервной копии</button></form>{% endif %}
+{% if state.backup %}<p>Резервная копия: {{ state.backup }}</p>{% endif %}
+<p>Известные резервные копии:</p><ul>{% for backup in backups %}<li>{{ backup }}</li>{% endfor %}</ul>
+<p>При восстановлении старой резервной копии будут потеряны все данные и изменения, внесённые после момента её создания.</p>
+</html>''', state=maintenance, target=SINVER_VERSION, backups=backups), 503
+    # Run before inventory's connection hook, including for every existing URL.
+    app.before_request_funcs.setdefault(None, []).insert(0, gate)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="sinver.py",
@@ -1700,13 +1911,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help=f"Путь к TOML-конфигу (по умолчанию {DEFAULT_CONFIG_PATH})")
     parser.add_argument("--debug", action="store_true", help="Режим отладки: подробные ошибки в веб-интерфейсе")
-    parser.add_argument("--init-if-missing", action="store_true", help="Автоматически создать БД без вопроса")
+    parser.add_argument("--init-if-missing", action="store_true", help="Совместимость: отсутствующая БД теперь создаётся bootstrap-слоем автоматически")
     return parser.parse_args(argv)
-
-
-def ask_create_db(path: Path) -> bool:
-    answer = input(f"Database {path} not found or empty. Create it now? [y/N]: ").strip().lower()
-    return answer in {"y", "yes"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1721,33 +1927,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: cannot configure logging: {exc}", file=sys.stderr)
         return 1
 
-    db_path = config.database_path
-    init_sql_path = resolve_init_sql_path()
-
-    if init_sql_path is None:
-        print(
-            f"ERROR: init script not found. Checked: {INIT_SQL_PATH}, {INSTALL_INIT_SQL_PATH}",
-            file=sys.stderr,
-        )
-        return 1
-
-    needs_init = (not db_path.exists()) or (db_path.exists() and db_path.stat().st_size == 0)
-    if needs_init:
-        print(f"INFO: database file {db_path} is missing or empty.")
-        if args.init_if_missing or ask_create_db(db_path):
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            init_database(db_path, init_sql_path)
-            print("INFO: database created successfully.")
-        else:
-            print("INFO: database creation canceled.")
-            return 1
-
-    ok, reason = validate_database(db_path)
-    if not ok:
-        print(f"ERROR: database validation failed: {reason}", file=sys.stderr)
-        return 1
-
-    app = create_app(db_path, config.database_backup_path, debug_mode=args.debug)
+    bootstrap = DatabaseMaintenance(config.database_path, config.database_backup_path)
+    bootstrap.prepare()
+    app = create_app(config.database_path, config.database_backup_path, debug_mode=args.debug)
+    install_maintenance_gate(app, bootstrap)
     logging.getLogger("sinver").info("SINVER started successfully: http://%s:%s", config.http_addr, config.http_port)
     app.run(host=config.http_addr, port=config.http_port, debug=False)
     return 0

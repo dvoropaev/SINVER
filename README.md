@@ -107,7 +107,7 @@ SINVER умеет напрямую обновлять записи в PostgreSQL
 
 SINVER использует для хранения данных SQLite со следующей структурой.
 
-Готовый SQL-скрипт инициализации: `init_db.sql`.
+Готовый SQL-скрипт инициализации: `database/init_db.sql`.
 
 ### Таблица «Зоны»
 
@@ -196,8 +196,8 @@ SINVER читает настройки из TOML-файла `/etc/sinver.toml`. 
 каталога конфигурационного файла.
 
 ```toml
-database_path = "/var/sinver/sinver.sqlite"
-database_backup_path = "/var/sinver/backups"
+database_path = "/var/lib/sinver/sinver.sqlite"
+database_backup_path = "/var/lib/sinver/backups"
 http_addr = "127.0.0.1"
 http_port = 8080
 log_file = "/var/log/sinver/sinver.log"
@@ -208,17 +208,23 @@ log_file = "/var/log/sinver/sinver.log"
 
 ## Установка
 
-При установке через `make install` SQL-скрипт инициализации копируется в `/usr/share/sinver/init_db.sql`.
-Исполняемый файл `/usr/bin/sinver` при автосоздании базы ищет `init_db.sql` сначала рядом с исходником, а затем по пути `/usr/share/sinver/init_db.sql`.
+`make install` копирует актуальную схему из `database/init_db.sql` в
+`/usr/share/sinver/init_db.sql`, а содержимое `database/migrations/` — в
+`/usr/share/sinver/migrations/`. Установка не создаёт и не изменяет пользовательскую БД.
+Схема обновляется при каждой установке. Если прежняя установка выставила immutable,
+перед обновлением снимите его: `sudo chattr -i /usr/share/sinver/init_db.sql`.
 
-### Защита `init_db.sql`
-
-Скрипт установки применяет усиленную защиту от перезаписи для `/usr/share/sinver/init_db.sql`:
-- файл создаётся только если отсутствует;
-- права выставляются как `0444` (только чтение);
-- при наличии `chattr` дополнительно включается атрибут immutable (`chattr +i`).
+Текущая версия SINVER — `0.0.0`. При первом запуске bootstrap автоматически создаёт
+отсутствующую БД и проверяет её. Существующие конфиги сохраняются, включая старые пути БД.
+Неверная схема, более новая версия или ошибка миграции блокируют основной интерфейс:
+по любому URL доступна страница Maintenance mode без подключения к таблицам приложения.
+Для БД без служебной версии предполагается `0.0.0`: добавление метаданных требует
+подтверждения в Web UI и предварительного backup. Ошибки пишутся в лог и stdout.
+После исправления причины ошибки перезапустите SINVER. Backup сохраняется после успеха.
 
 ### Бэкапы SQLite
 
 Перед каждым изменением SQLite-базы `sinver.py` автоматически создаёт резервную копию в каталоге `database_backup_path`.
 Формат имени: `<имя_базы>.<YYYYMMDD_HHMMSS_microseconds>.bak`.
+
+Проверка bootstrap и Maintenance mode: `python tests/maintenance_smoke.py` (требуется Flask).
