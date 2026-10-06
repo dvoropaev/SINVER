@@ -26,7 +26,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-from flask import Flask, Response, flash, g, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, Response, flash, g, redirect, render_template_string, request, send_file, session, url_for
 
 try:
     import psycopg2
@@ -286,6 +286,36 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
     app.config["POWERDNS_PLAN_CACHE"] = {}
     app.config["POWERDNS_PLAN_TTL_SECONDS"] = 600
 
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+    def csrf_token() -> str:
+        token = session.get("csrf_token")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session["csrf_token"] = token
+        return token
+
+    app.jinja_env.globals["csrf_token"] = csrf_token
+
+    @app.before_request
+    def _protect_csrf() -> Response | None:
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return None
+        expected = session.get("csrf_token")
+        submitted = request.form.get("csrf_token")
+        if (
+            not isinstance(expected, str)
+            or not submitted
+            or not secrets.compare_digest(expected.encode("utf-8"), submitted.encode("utf-8"))
+        ):
+            return Response(
+                "CSRF validation failed. Reload the page and submit the form again.",
+                status=400,
+                mimetype="text/plain",
+            )
+        return None
+
     # -------------------------
     # SQLite helpers
     # -------------------------
@@ -537,7 +567,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             </div>
             <div class="panel">
               <h2>Add server</h2>
-              <form method="post" action="{{ url_for('server_create') }}" class="grid">
+              <form method="post" action="{{ url_for('server_create') }}" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div><label>Hostname</label><input required name="hostname"></div>
                 <div><label>Primary zone</label><select name="primary_zone_id"><option value="">None</option>{% for z in zones %}<option value="{{ z.id }}">{{ z.zone }}</option>{% endfor %}</select></div>
                 <div><label>Role</label><select name="role_id"><option value="">None</option>{% for r in role_rows %}<option value="{{r.id}}">{{r.role_name}}</option>{% endfor %}</select></div>
@@ -614,7 +644,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
         body = render_template_string(
             """
             <div class="panel"><h1>Server: {{ title }}</h1>
-            <form id="server-form" class="readonly" method="post">
+            <form id="server-form" class="readonly" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <div class="grid">
                 <div><label>Hostname</label><input data-editable readonly name="hostname" value="{{ row.hostname }}"></div>
                 <div><label>Primary zone</label><select data-editable disabled name="primary_zone_id"><option value="">None</option>{% for z in zones %}<option value="{{ z.id }}" {% if z.id == row.primary_zone_id %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
@@ -626,7 +656,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             </form></div>
             <div class="panel"><h2>IP addresses</h2><ul>{% for ip in ips %}<li><a href="{{ url_for('ip_detail', ip_id=ip.id) }}">{{ ip.ip }}</a>{% if ip.is_primary %} (Primary){% endif %}</li>{% else %}<li>—</li>{% endfor %}</ul></div>
             <div class="panel"><h2>Subdomains linked to this server</h2><ul>{% for sd in linked_subdomains %}<li><a href="{{ url_for('subdomain_detail', subdomain_id=sd.id) }}">{{ sd.record_type }} {{ sd.subdomain }}.{{ sd.zone }}</a></li>{% else %}<li>—</li>{% endfor %}</ul></div>
-            <div class="panel"><form method="post" action="{{ url_for('server_delete', server_id=row.id) }}" onsubmit="return confirm('Delete server and linked IP relations?')"><button class="btn danger">Delete server</button></form></div>
+            <div class="panel"><form method="post" action="{{ url_for('server_delete', server_id=row.id) }}" onsubmit="return confirm('Delete server and linked IP relations?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger">Delete server</button></form></div>
             """,
             row=row,
             title=f"{row['hostname']}.{row['zone']}" if row["zone"] else row["hostname"],
@@ -700,7 +730,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
               <tr><td>{% if ip_colors[row.id] %}<span class="dot" style="background:{{ ip_colors[row.id] }}"></span>{% endif %}</td><td>{{ row.ip_type }}</td><td><a href="{{ url_for('ip_detail', ip_id=row.id) }}">{{ row.ip }}</a></td><td>{{ row.hostname }}{% if row.zone %}.{{ row.zone }}{% endif %}</td><td>{{ row.role_name or '—' }}</td><td>{{ 'Primary' if row.is_primary else '' }}</td></tr>
             {% endfor %}</tbody></table></div>
             <div class="panel"><h2>Add IP</h2>
-              <form method="post" action="{{ url_for('ip_create') }}" class="grid">
+              <form method="post" action="{{ url_for('ip_create') }}" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div><label>Type</label><select name="ip_type"><option>IPv4</option><option>IPv6</option></select></div>
                 <div><label>IP</label><input required name="ip"></div>
                 <div><label>Server</label><select name="server_id">{% for s in servers %}<option value="{{ s.id }}">{{ s.hostname }}</option>{% endfor %}</select></div>
@@ -797,7 +827,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
         body = render_template_string(
             """
             <div class="panel"><h1>IP: {{ row.ip }}</h1>
-              <form id="ip-form" class="readonly" method="post"><div class="grid">
+              <form id="ip-form" class="readonly" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="grid">
                 <div><label>Type</label><input readonly value="{{ row.ip_type }}"></div>
                 <div><label>IP</label><input readonly value="{{ row.ip }}"></div>
                 <div><label>Server</label><select data-editable disabled name="server_id">{% for s in servers %}<option value="{{ s.id }}" {% if s.id == row.server_id %}selected{% endif %}>{{ s.hostname }}</option>{% endfor %}</select></div>
@@ -806,7 +836,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
               </div><div class="actions"><button type="button" class="btn" onclick="enableEdit('ip-form')">Edit</button><button class="btn primary save-btn" disabled>Save</button></div></form>
             </div>
             <div class="panel"><h2>Linked subdomains</h2><ul>{% for sd in subdomains_rows %}<li><a href="{{ url_for('subdomain_detail', subdomain_id=sd.id) }}">{{ sd.record_type }} {{ sd.subdomain }}.{{ sd.zone }}</a></li>{% else %}<li>—</li>{% endfor %}</ul></div>
-            <div class="panel"><form method="post" action="{{ url_for('ip_delete', ip_id=row.id) }}" onsubmit="return confirm('Delete IP?')"><button class="btn danger">Delete IP</button></form></div>
+            <div class="panel"><form method="post" action="{{ url_for('ip_delete', ip_id=row.id) }}" onsubmit="return confirm('Delete IP?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger">Delete IP</button></form></div>
             """,
             row=row,
             servers=q("SELECT id, hostname FROM servers ORDER BY hostname"),
@@ -879,7 +909,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             {% for row in rows %}<tr><td>{% if sd_colors[row.id] %}<span class="dot" style="background:{{ sd_colors[row.id] }}"></span>{% endif %}</td><td>{{ row.record_type }}</td><td><a href="{{ url_for('subdomain_detail', subdomain_id=row.id) }}">{{ row.subdomain }}</a></td><td>{{ row.zone }}</td><td style="white-space:pre-line" class="mono">{{ row.ips or '—' }}</td><td>{{ row.role_name or '—' }}</td></tr>{% endfor %}
             </tbody></table></div>
             <div class="panel"><h2>Add subdomain</h2>
-              <form method="post" action="{{ url_for('subdomain_create') }}" class="grid">
+              <form method="post" action="{{ url_for('subdomain_create') }}" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div><label>Type</label><select name="record_type">{% for rt in record_types %}<option>{{ rt }}</option>{% endfor %}</select></div>
                 <div><label>Name</label><input required name="subdomain"></div>
                 <div><label>Zone</label><select name="zone_id">{% for z in zones %}<option value="{{ z.id }}">{{ z.zone }}</option>{% endfor %}</select></div>
@@ -965,7 +995,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
         body = render_template_string(
             """
             <div class="panel"><h1>Subdomain #{{ row.id }}</h1>
-              <form id="sd-form" class="readonly" method="post"><div class="grid">
+              <form id="sd-form" class="readonly" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="grid">
                 <div><label>Type</label><select data-editable disabled name="record_type">{% for rt in record_types %}<option {% if rt == row.record_type %}selected{% endif %}>{{ rt }}</option>{% endfor %}</select></div>
                 <div><label>Name</label><input data-editable readonly name="subdomain" value="{{ row.subdomain }}"></div>
                 <div><label>Zone</label><select data-editable disabled name="zone_id">{% for z in zones %}<option value="{{ z.id }}" {% if z.id == row.zone_id %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
@@ -976,7 +1006,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
               </div><div class="actions"><button type="button" class="btn" onclick="enableEdit('sd-form')">Edit</button><button class="btn primary save-btn" disabled>Save</button></div></form>
             </div>
             <div class="panel"><h2>Servers mapped by this subdomain</h2><ul>{% for s in servers_rows %}<li>{{ s.hostname }}{% if s.zone %}.{{ s.zone }}{% endif %}</li>{% else %}<li>—</li>{% endfor %}</ul></div>
-            <div class="panel"><form method="post" action="{{ url_for('subdomain_delete', subdomain_id=row.id) }}" onsubmit="return confirm('Delete subdomain?')"><button class="btn danger">Delete subdomain</button></form></div>
+            <div class="panel"><form method="post" action="{{ url_for('subdomain_delete', subdomain_id=row.id) }}" onsubmit="return confirm('Delete subdomain?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger">Delete subdomain</button></form></div>
             """,
             row=row,
             record_types=SUBDOMAIN_RECORD_TYPES,
@@ -1033,7 +1063,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             <div class="panel"><table><thead><tr><th>Color</th><th>Name</th><th>Description</th></tr></thead><tbody>
             {% for row in rows %}<tr title="{{ short(row['description']) }}"><td>{% if row.color %}<span class="dot" style="background:{{ row.color }}"></span>{% endif %}</td><td><a href="{{ url_for('role_detail', role_id=row.id) }}">{{ row.role_name }}</a></td><td>{{ short(row.description) or '—' }}</td></tr>{% endfor %}
             </tbody></table></div>
-            <div class="panel"><h2>Add role</h2><form method="post" action="{{ url_for('role_create') }}" class="grid">
+            <div class="panel"><h2>Add role</h2><form method="post" action="{{ url_for('role_create') }}" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <div><label>Name</label><input required name="role_name"></div>
               <div><label>Color</label><input name="color" type="color" value="#8d7b68"></div>
               <div style="grid-column:1/-1"><label>Description</label><textarea name="description"></textarea></div>
@@ -1073,7 +1103,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
 
         body = render_template_string(
             """
-            <div class="panel"><h1>Role: {{ row.role_name }}</h1><form id="role-form" class="readonly" method="post"><div class="grid">
+            <div class="panel"><h1>Role: {{ row.role_name }}</h1><form id="role-form" class="readonly" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="grid">
             <div><label>Name</label><input data-editable readonly name="role_name" value="{{ row.role_name }}"></div>
             <div><label>Color</label><input data-editable disabled type="color" name="color" value="{{ row.color }}"></div>
             <div style="grid-column:1/-1"><label>Description</label><textarea data-editable readonly name="description">{{ row.description or '' }}</textarea></div>
@@ -1081,7 +1111,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             <div class="panel"><h2>Servers with this role</h2><ul>{% for s in servers_rows %}<li><a href="{{ url_for('server_detail', server_id=s.id) }}">{{ s.hostname }}</a></li>{% else %}<li>—</li>{% endfor %}</ul></div>
             <div class="panel"><h2>IP addresses with this role</h2><ul>{% for ip in ips_rows %}<li><a href="{{ url_for('ip_detail', ip_id=ip.id) }}">{{ ip.ip }}</a></li>{% else %}<li>—</li>{% endfor %}</ul></div>
             <div class="panel"><h2>Subdomains with this role</h2><ul>{% for sd in subdomains_rows %}<li><a href="{{ url_for('subdomain_detail', subdomain_id=sd.id) }}">{{ sd.record_type }} {{ sd.subdomain }}</a></li>{% else %}<li>—</li>{% endfor %}</ul></div>
-            <div class="panel"><form method="post" action="{{ url_for('role_delete', role_id=row.id) }}" onsubmit="return confirm('Delete role?')"><button class="btn danger">Delete role</button></form></div>
+            <div class="panel"><form method="post" action="{{ url_for('role_delete', role_id=row.id) }}" onsubmit="return confirm('Delete role?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger">Delete role</button></form></div>
             """,
             row=row,
             servers_rows=q("SELECT id, hostname FROM servers WHERE role_id=? ORDER BY hostname", (role_id,)),
@@ -1151,7 +1181,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             <div class="panel"><table><thead><tr><th>Name</th><th>URL</th><th>servers</th><th>Paid until</th><th>Description</th></tr></thead><tbody>
             {% for row in rows %}<tr title="{{ short(row['description']) }}"><td><a href="{{ url_for('hosting_detail', hosting_id=row.id) }}">{{ row.name }}</a></td><td>{% if row.url %}<a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.url }}</a>{% else %}—{% endif %}</td><td>{{ row.server_count }}</td><td>{{ row.paid_until or '—' }}</td><td>{{ short(row.description) or '—' }}</td></tr>{% endfor %}
             </tbody></table></div>
-            <div class="panel"><h2>Add hosting</h2><form method="post" action="{{ url_for('hosting_create') }}" class="grid">
+            <div class="panel"><h2>Add hosting</h2><form method="post" action="{{ url_for('hosting_create') }}" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <div><label>Name</label><input required name="name"></div><div><label>URL</label><input name="url" type="url"></div><div><label>Paid until</label><input name="paid_until" type="date"></div>
               <div style="grid-column:1/-1"><label>Description</label><textarea name="description"></textarea></div><div class="actions"><button class="btn primary">Create</button></div></form></div>
             """,
@@ -1188,7 +1218,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
 
         body = render_template_string(
             """
-            <div class="panel"><h1>Hosting: {{ row.name }}</h1><form id="hosting-form" class="readonly" method="post"><div class="grid">
+            <div class="panel"><h1>Hosting: {{ row.name }}</h1><form id="hosting-form" class="readonly" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="grid">
             <div><label>Name</label><input data-editable readonly name="name" value="{{ row.name }}"></div>
             <div><label>URL</label><input data-editable readonly type="url" name="url" value="{{ row.url or '' }}"></div>
             <div><label>Paid until</label><input data-editable readonly type="date" name="paid_until" value="{{ row.paid_until or '' }}"></div>
@@ -1196,7 +1226,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             </div><div class="actions"><button type="button" class="btn" onclick="enableEdit('hosting-form')">Edit</button><button class="btn primary save-btn" disabled>Save</button></div></form></div>
             <div class="panel"><h2>Servers in this hosting</h2><ul>{% for s in servers_rows %}<li><a href="{{ url_for('server_detail', server_id=s.id) }}">{{ s.hostname }}</a></li>{% else %}<li>—</li>{% endfor %}</ul></div>
             <div class="panel"><h2>External link</h2>{% if row.url %}<a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.url }}</a>{% else %}<span>—</span>{% endif %}</div>
-            <div class="panel"><form method="post" action="{{ url_for('hosting_delete', hosting_id=row.id) }}" onsubmit="return confirm('Delete hosting?')"><button class="btn danger">Delete hosting</button></form></div>
+            <div class="panel"><form method="post" action="{{ url_for('hosting_delete', hosting_id=row.id) }}" onsubmit="return confirm('Delete hosting?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger">Delete hosting</button></form></div>
             """,
             row=row,
             servers_rows=q("SELECT id, hostname FROM servers WHERE hosting_id=? ORDER BY hostname", (hosting_id,)),
@@ -1262,7 +1292,7 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             <div class="panel"><table><thead><tr><th>Zone</th><th>MNAME</th><th>RNAME</th><th>SERIAL</th><th>REFRESH</th><th>RETRY</th><th>EXPIRE</th><th>MINIMUM</th><th>psql address</th><th>psql user</th><th>Description</th></tr></thead><tbody>
             {% for row in rows %}<tr title="{{ short(row['description']) }}"><td><a href="{{ url_for('zone_detail', zone_id=row.id) }}">{{ row.zone }}</a></td><td>{{ row.mname }}</td><td>{{ row.rname }}</td><td>{{ row.serial }}</td><td>{{ row.refresh }}</td><td>{{ row.retry }}</td><td>{{ row.expire }}</td><td>{{ row.minimum }}</td><td>{{ row.psql_address or '—' }}</td><td>{{ row.psql_user or '—' }}</td><td>{{ short(row.description) or '—' }}</td></tr>{% endfor %}
             </tbody></table></div>
-            <div class="panel"><h2>Add zone</h2><form method="post" action="{{ url_for('zone_create') }}" class="grid">
+            <div class="panel"><h2>Add zone</h2><form method="post" action="{{ url_for('zone_create') }}" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <div><label>Zone</label><input required name="zone"></div><div><label>MNAME</label><input required name="mname"></div><div><label>RNAME</label><input required name="rname"></div><div><label>SERIAL</label><input required name="serial"></div>
               <div><label>REFRESH</label><input required name="refresh"></div><div><label>RETRY</label><input required name="retry"></div><div><label>EXPIRE</label><input required name="expire"></div><div><label>MINIMUM</label><input required name="minimum"></div>
               <div><label>PostgreSQL address</label><input name="psql_address"></div><div><label>DB name</label><input name="db_name" placeholder="powerdns"></div><div><label>PostgreSQL user</label><input name="psql_user"></div><div><label>PostgreSQL password</label><input type="password" name="psql_password"></div>
@@ -1319,14 +1349,14 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
 
         body = render_template_string(
             """
-            <div class="panel"><h1>Zone: {{ row.zone }}</h1><form id="zone-form" class="readonly" method="post"><div class="grid">
+            <div class="panel"><h1>Zone: {{ row.zone }}</h1><form id="zone-form" class="readonly" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="grid">
             {% for name in ['zone','mname','rname','serial','refresh','retry','expire','minimum','psql_address','db_name','psql_user'] %}
               <div><label>{{ name }}</label><input data-editable readonly name="{{ name }}" value="{{ row[name] or '' }}"></div>
             {% endfor %}
             <div><label>psql_password</label><input data-editable readonly name="psql_password" type="password" placeholder="Leave empty to keep unchanged"></div>
             <div style="grid-column:1/-1"><label>Description</label><textarea data-editable readonly name="description">{{ row.description or '' }}</textarea></div>
             </div><div class="actions"><button type="button" class="btn" onclick="enableEdit('zone-form')">Edit</button><button class="btn primary save-btn" disabled>Save</button><a class="btn" href="{{ url_for('dns', zone_id=row.id) }}">Go to DNS tab</a></div></form></div>
-            <div class="panel"><form method="post" action="{{ url_for('zone_delete', zone_id=row.id) }}" onsubmit="return confirm('Delete zone?')"><button class="btn danger">Delete zone</button></form></div>
+            <div class="panel"><form method="post" action="{{ url_for('zone_delete', zone_id=row.id) }}" onsubmit="return confirm('Delete zone?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger">Delete zone</button></form></div>
             """,
             row=row,
         )
@@ -1356,12 +1386,12 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
             """
             <div class="panel"><h1>DNS</h1><p class="muted">Push to PowerDNS/PostgreSQL or generate Bind9 config.</p></div>
             <div class="panel"><h2>PowerDNS + PostgreSQL</h2>
-              <form method="post" class="grid"><div><label>Zone</label><select name="zone_id">{% for z in zones_rows %}<option value="{{ z.id }}" {% if z.id == selected_zone_id %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
+              <form method="post" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div><label>Zone</label><select name="zone_id">{% for z in zones_rows %}<option value="{{ z.id }}" {% if z.id == selected_zone_id %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
                 <div class="actions"><button class="btn primary" name="action" value="powerdns">Push</button></div>
               </form>
             </div>
             <div class="panel"><h2>Bind9</h2>
-              <form method="post" class="grid"><div><label>Zone</label><select name="zone_id">{% for z in zones_rows %}<option value="{{ z.id }}" {% if z.id == selected_zone_id %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
+              <form method="post" class="grid"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div><label>Zone</label><select name="zone_id">{% for z in zones_rows %}<option value="{{ z.id }}" {% if z.id == selected_zone_id %}selected{% endif %}>{{ z.zone }}</option>{% endfor %}</select></div>
                 <div class="actions"><button class="btn" name="action" value="bind">Generate config</button></div>
               </form>
             </div>
@@ -1372,14 +1402,14 @@ def create_app(db_path: Path, backup_path: Path | None = None, debug_mode: bool 
                   <pre class="mono">{{ preview.diff_text }}</pre>
                   <h3>SQL preview</h3><pre class="mono">{{ preview.sql_preview }}</pre>
                   {% if preview.require_force %}
-                  <form method="post" action="{{ url_for('dns') }}">
+                  <form method="post" action="{{ url_for('dns') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="zone_id" value="{{ selected_zone_id }}">
                     <input type="hidden" name="action" value="powerdns">
                     <input type="hidden" name="force" value="1">
                     <button class="btn">Все равно продолжить</button>
                   </form>
                   {% else %}
-                  <form method="post" action="{{ url_for('dns_powerdns_apply') }}">
+                  <form method="post" action="{{ url_for('dns_powerdns_apply') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="zone_id" value="{{ selected_zone_id }}">
                     <input type="hidden" name="plan_token" value="{{ preview.plan_token }}">
                     <button class="btn primary" onclick="return confirm('Apply update to PowerDNS?')">Confirm apply</button>
