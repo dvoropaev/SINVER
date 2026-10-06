@@ -122,7 +122,7 @@ SINVER умеет напрямую обновлять записи в PostgreSQL
 
 SINVER использует для хранения данных SQLite со следующей структурой.
 
-Готовый SQL-скрипт инициализации: `init_db.sql`.
+Готовый SQL-скрипт инициализации: `database/init_db.sql`.
 
 ### Таблица «Зоны»
 
@@ -211,8 +211,8 @@ SINVER читает настройки из TOML-файла `/etc/sinver.toml`. 
 каталога конфигурационного файла.
 
 ```toml
-database_path = "/var/sinver/sinver.sqlite"
-database_backup_path = "/var/sinver/backups"
+database_path = "/var/lib/sinver/sinver.sqlite"
+database_backup_path = "/var/lib/sinver/backups"
 http_addr = "127.0.0.1"
 http_port = 8080
 log_file = "/var/log/sinver/sinver.log"
@@ -223,17 +223,106 @@ log_file = "/var/log/sinver/sinver.log"
 
 ## Установка
 
-При установке через `make install` SQL-скрипт инициализации копируется в `/usr/share/sinver/init_db.sql`.
-Исполняемый файл `/usr/bin/sinver` при автосоздании базы ищет `init_db.sql` сначала рядом с исходником, а затем по пути `/usr/share/sinver/init_db.sql`.
+`make install` копирует актуальную схему из `database/init_db.sql` в
+`/usr/share/sinver/init_db.sql`, а содержимое `database/migrations/` — в
+`/usr/share/sinver/migrations/`. Установка не создаёт БД и не изменяет её содержимое.
+Схема обновляется при каждой установке. Если прежняя установка выставила immutable,
+перед обновлением снимите его: `sudo chattr -i /usr/share/sinver/init_db.sql`.
 
-### Защита `init_db.sql`
+Обычная установка выполняется от root:
 
-Скрипт установки применяет усиленную защиту от перезаписи для `/usr/share/sinver/init_db.sql`:
-- файл создаётся только если отсутствует;
-- права выставляются как `0444` (только чтение);
-- при наличии `chattr` дополнительно включается атрибут immutable (`chattr +i`).
+```bash
+sudo make install
+sudo systemctl enable --now sinver.service
+```
+
+Установщик создаёт системные группу и пользователя `sinver` средствами
+`getent`, `groupadd --system` и `useradd --system` (shadow-utils, обычные
+Linux-дистрибутивы). Home — `/var/lib/sinver`; каталог создаётся установщиком,
+shell — доступный `nologin`, с резервным вариантом `/bin/false`.
+Существующие пользователь и группа сохраняются: UID/GID и параметры учётной
+записи не меняются. Для уже существующей учётной записи администратор должен
+проверить, что она системная и не допускает интерактивный вход; UID/GID 0
+установщик отклоняет. Повторная установка сохраняет содержимое `/etc/sinver.toml`,
+но исправляет его владельца и права на `root:sinver 0640`.
+
+| Путь | Владелец | Права |
+| --- | --- | --- |
+| `/usr/bin/sinver` | `root:root` | `0755` |
+| `/usr/share/sinver/` и каталоги миграций | `root:root` | `0755` |
+| Схема и файлы миграций | `root:root` | `0644` |
+| `/etc/systemd/system/sinver.service` | `root:root` | `0644` |
+| `/etc/sinver.toml` | `root:sinver` | `0640` |
+| `/var/lib/sinver/` и `/var/log/sinver/` | `sinver:sinver` | `0750` |
+| `/var/lib/sinver/backups/` и его подкаталоги | `sinver:sinver` | `0700` |
+| Существующие файлы данных, backup и логов в этих каталогах | `sinver:sinver` | `0600` |
+
+Сервис запускается с `User=sinver`, `Group=sinver` и `UMask=0077`: новая SQLite-БД,
+её служебные файлы, backup и логи создаются от `sinver` с закрытыми правами.
+Пользователя и группу `sinver` следует выделять только этому сервису: SQLite
+может содержать пароль PostgreSQL. Код, схема и миграции доступны сервису только
+для чтения. `make install` выполняет `systemctl daemon-reload`, но не запускает
+и не перезапускает сервис автоматически.
+
+Unit использует `NoNewPrivileges=true` и `ProtectSystem=full`: `/usr`, `/boot`
+и `/etc` доступны только для чтения внутри сервиса. Запись в каталоги данных
+и логов, исходящие TCP-соединения к PostgreSQL/PowerDNS и прослушивание
+`127.0.0.1:8080` (либо другого непривилегированного порта) разрешены.
+`ProtectSystem=strict` с фиксированными `ReadWritePaths` и `ProtectHome` не
+применяются, чтобы сохранить пользовательские пути из конфигурации.
+`PrivateTmp` не применяется, поскольку PostgreSQL может использовать Unix-сокет
+в `/tmp`. Для ручного запуска используйте `umask 0077` и пользователя `sinver`.
+
+### Обновление установки, работавшей от root
+
+Перед повторной установкой остановите сервис: `sudo systemctl stop sinver.service`.
+Установщик передаёт существующие данные, backup и логи внутри `/var/lib/sinver`
+и `/var/log/sinver` пользователю `sinver` и закрывает их от других пользователей.
+Содержимое файлов при этом сохраняется. После установки запустите сервис:
+`sudo systemctl start sinver.service`.
+
+Старые и нестандартные пути в конфиге не изменяются автоматически. Если конфиг
+ещё использует `/var/sinver`, перед запуском передайте этот каталог сервису:
+
+```bash
+sudo chown -R sinver:sinver /var/sinver
+sudo find /var/sinver -type d -exec chmod 0750 {} +
+sudo find /var/sinver -type f -exec chmod 0600 {} +
+sudo find /var/sinver/backups -type d -exec chmod 0700 {} +
+```
+
+Для других путей обеспечьте аналогичные владельцев и права, включая доступ
+`sinver` к родительским каталогам. Изменяемые данные должны находиться вне
+защищённых `/usr`, `/boot` и `/etc`.
+
+### Staged-установка и пакеты
+
+```bash
+make DESTDIR=/path/to/package-root install
+```
+
+При непустом `DESTDIR` установщик работает без root, не вызывает `getent`,
+`groupadd`, `useradd`, `chown` или `systemctl` в host-системе и не создаёт SQLite.
+Права файлов выставляются как при обычной установке; владельцем в staging
+остаётся пользователь сборки. Пакет должен назначить владельцев из таблицы
+средствами упаковщика и обеспечить создание системной учётной записи на целевой
+системе до назначения владельцев конфигу и данным. Скрипт настройки пакета также
+должен сохранить существующий конфиг, исправить права существующих данных
+и выполнить `systemctl daemon-reload` на целевой системе.
+
+Текущая версия SINVER — `0.0.0`. При первом запуске bootstrap автоматически создаёт
+отсутствующую БД и проверяет её. Существующие конфиги сохраняются, включая старые пути БД.
+Неверная схема, более новая версия или ошибка миграции блокируют основной интерфейс:
+по любому URL доступна страница Maintenance mode без подключения к таблицам приложения.
+Для БД без служебной версии предполагается `0.0.0`: добавление метаданных требует
+подтверждения в Web UI и предварительного backup. Ошибки пишутся в лог и stdout.
+После исправления причины ошибки перезапустите SINVER. Backup сохраняется после успеха.
 
 ### Бэкапы SQLite
 
 Перед каждым изменением SQLite-базы `sinver.py` автоматически создаёт резервную копию в каталоге `database_backup_path`.
 Формат имени: `<имя_базы>.<YYYYMMDD_HHMMSS_microseconds>.bak`.
+
+Проверка bootstrap и Maintenance mode: `python tests/maintenance_smoke.py` (требуется Flask).
+Проверка staged-установки, прав и сохранения данных: `python3 tests/install_smoke.py`
+(требуется GNU make; root не нужен).
