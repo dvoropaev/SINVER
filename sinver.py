@@ -26,6 +26,9 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from flask import Flask, Response, flash, g, redirect, render_template_string, request, send_file, url_for
 
+sys.path.append("/usr/share/sinver")
+from sinver_database import DatabaseBootstrap, create_maintenance_app
+
 try:
     import psycopg2
     from psycopg2 import extras as psycopg2_extras
@@ -35,7 +38,8 @@ except Exception:  # noqa: BLE001
 
 
 BASE_DIR = Path(__file__).resolve().parent
-INIT_SQL_PATH = BASE_DIR / "init_db.sql"
+SINVER_VERSION = "0.0.0"
+INIT_SQL_PATH = BASE_DIR / "sqlite" / "init_db.sql"
 INSTALL_INIT_SQL_PATH = Path("/usr/share/sinver/init_db.sql")
 DEFAULT_PORT = 5173
 MAX_TOOLTIP_LEN = 50
@@ -1595,8 +1599,13 @@ def init_database(db_path: Path, init_sql_path: Path) -> None:
 
 def validate_database(db_path: Path) -> tuple[bool, str]:
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
+            integrity = conn.execute("PRAGMA integrity_check").fetchall()
+            if [row[0] for row in integrity] != ["ok"]:
+                return False, f"SQLite integrity check failed: {integrity}"
+            if conn.execute("PRAGMA foreign_key_check").fetchone():
+                return False, "SQLite foreign key check failed"
             tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             missing = REQUIRED_TABLES - tables
             if missing:
@@ -1633,45 +1642,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP порт (по умолчанию {DEFAULT_PORT})")
     parser.add_argument("--debug", action="store_true", help="Режим отладки: подробные ошибки в веб-интерфейсе")
     parser.add_argument("--init-if-missing", action="store_true", help="Автоматически создать БД без вопроса")
+    parser.add_argument("--backup-dir", type=Path, default=Path("/var/lib/sinver/backups"), help="Каталог резервных копий миграций")
+    parser.add_argument("--maintenance", action="store_true", help="Открыть интерфейс обслуживания БД")
+    parser.add_argument("--version", action="version", version=f"SINVER {SINVER_VERSION}")
     return parser.parse_args(argv)
-
-
-def ask_create_db(path: Path) -> bool:
-    answer = input(f"Database {path} not found or empty. Create it now? [y/N]: ").strip().lower()
-    return answer in {"y", "yes"}
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     db_path: Path = args.db
-    init_sql_path = resolve_init_sql_path()
-
-    if init_sql_path is None:
-        print(
-            f"ERROR: init script not found. Checked: {INIT_SQL_PATH}, {INSTALL_INIT_SQL_PATH}",
-            file=sys.stderr,
-        )
-        return 1
-
-    needs_init = (not db_path.exists()) or (db_path.exists() and db_path.stat().st_size == 0)
-    if needs_init:
-        print(f"INFO: database file {db_path} is missing or empty.")
-        if args.init_if_missing or ask_create_db(db_path):
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            init_database(db_path, init_sql_path)
-            print("INFO: database created successfully.")
-        else:
-            print("INFO: database creation canceled.")
-            return 1
-
-    ok, reason = validate_database(db_path)
-    if not ok:
-        print(f"ERROR: database validation failed: {reason}", file=sys.stderr)
-        return 1
-
-    app = create_app(db_path, debug_mode=args.debug)
-    print(f"SINVER started successfully: http://127.0.0.1:{args.port}")
-    app.run(host="127.0.0.1", port=args.port, debug=False)
+    migrations_path = BASE_DIR / "sqlite" / "migrations"
+    if not migrations_path.is_dir():
+        migrations_path = Path("/usr/share/sinver/migrations")
+    bootstrap = DatabaseBootstrap(
+        db_path, SINVER_VERSION, resolve_init_sql_path(), migrations_path,
+        args.backup_dir, validate_database,
+    )
+    bootstrap.inspect()
+    if args.init_if_missing and bootstrap.status == "missing":
+        bootstrap.create_database()
+    app = create_maintenance_app(
+        bootstrap, lambda: create_app(db_path, debug_mode=args.debug),
+        force_maintenance=args.maintenance,
+    )
+    mode = "database ready" if bootstrap.status == "ready" else "Maintenance mode"
+    print(f"SINVER {mode}: http://127.0.0.1:{args.port}")
+    try:
+        app.run(host="127.0.0.1", port=args.port, debug=False)
+    finally:
+        bootstrap.close()
     return 0
 
 

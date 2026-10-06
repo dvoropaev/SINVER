@@ -2,6 +2,25 @@ PRAGMA foreign_keys = ON;
 
 BEGIN TRANSACTION;
 
+-- Служебная версия SINVER и история обновлений БД.
+CREATE TABLE IF NOT EXISTS sinver_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT INTO sinver_meta (key, value) VALUES ('database_version', '0.0.0');
+
+CREATE TABLE IF NOT EXISTS migration_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_version TEXT NOT NULL,
+    to_version TEXT NOT NULL,
+    migration_id TEXT,
+    migration_type TEXT NOT NULL CHECK (migration_type IN ('migration', 'version_sync')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed')),
+    error_message TEXT
+);
+
 -- Таблица зон DNS.
 CREATE TABLE IF NOT EXISTS zones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
