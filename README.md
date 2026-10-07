@@ -42,3 +42,10 @@ python3 tests/install_smoke.py
 ```
 
 Подготовить файлы для пакета без установки в систему можно командой `make DESTDIR=/path/to/package-root install`. Она не создаёт служебную учётную запись и не вызывает `systemctl` на машине сборки. Создание пользователя `sinver`, назначение владельцев файлов и сохранение существующего конфигурационного файла при обновлении должен обеспечить пакет.
+
+## License
+
+SINVER is licensed under the GNU Affero General Public License,
+version 3 only (`AGPL-3.0-only`).
+
+See [LICENSE](LICENSE) for the full license text.
