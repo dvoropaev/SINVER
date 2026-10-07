@@ -216,15 +216,32 @@ sudo ss -lntup 'sport = :53'
 sudo -u postgres psql -v ON_ERROR_STOP=1
 ```
 
-Выполните в ней:
+Сначала создайте роли и включите SCRAM-SHA-256 для задаваемых далее паролей:
 
 ```sql
 CREATE ROLE powerdns_owner NOLOGIN;
 CREATE ROLE pdns_reader LOGIN;
 CREATE ROLE sinver_writer LOGIN;
 SET password_encryption = 'scram-sha-256';
+```
+
+Задайте пароли по одной команде за раз:
+
+```sql
 \password pdns_reader
+```
+
+Введите новый пароль дважды и дождитесь возврата приглашения `postgres=#`. Затем задайте отдельный пароль для SINVER:
+
+```sql
 \password sinver_writer
+```
+
+Снова введите пароль дважды и дождитесь приглашения `postgres=#`. Не вставляйте следующие SQL-команды, пока `\password` ожидает ввод: это интерактивная команда `psql`, и вставленный текст может быть воспринят как пароль.
+
+После установки обоих паролей продолжите настройку:
+
+```sql
 CREATE DATABASE powerdns OWNER powerdns_owner;
 \connect powerdns
 SET ROLE powerdns_owner;
@@ -242,7 +259,7 @@ GRANT USAGE ON SEQUENCE records_id_seq TO sinver_writer;
 \q
 ```
 
-Команды `\password` запрашивают пароли интерактивно. `SET ROLE` выполняет импорт схемы от имени её владельца, `RESET ROLE` возвращает права администратора, `\q` закрывает консоль. `ON_ERROR_STOP` прерывает импорт схемы при первой SQL-ошибке, но оставляет интерактивную консоль открытой. Если импорт завершился с ошибкой, не переходите к выдаче прав: сначала исправьте её и убедитесь, что схема создана полностью. Запомните отдельный пароль `sinver_writer`: он понадобится в карточке зоны SINVER.
+`SET ROLE` выполняет импорт схемы от имени её владельца, `RESET ROLE` возвращает права администратора, `\q` закрывает консоль. `ON_ERROR_STOP` прерывает выполнение при первой SQL-ошибке, но оставляет интерактивную консоль открытой. Если импорт завершился с ошибкой, не переходите к выдаче прав: сначала исправьте её и убедитесь, что схема создана полностью. Запомните отдельный пароль `sinver_writer`: он понадобится в карточке зоны SINVER.
 
 **Схема берётся из установленного пакета backend, чтобы соответствовать его версии.** Для другого выпуска Debian проверьте путь через `dpkg -L pdns-backend-pgsql`. Не импортируйте `database/init_db.sql` из SINVER в PostgreSQL: это схема собственной SQLite-базы приложения.
 
@@ -341,12 +358,19 @@ sudo chmod 640 /run/sinver-pdns-admin/pdns.conf
 ```bash
 sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin create-zone infra.example.net ns1.infra.example.net
 sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin set-kind infra.example.net NATIVE
-sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin replace-rrset infra.example.net infra.example.net SOA 3600 'ns1.infra.example.net. hostmaster.infra.example.net. 1 3600 600 1209600 300'
-sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin replace-rrset infra.example.net ns1.infra.example.net A 3600 192.0.2.53
+sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin replace-rrset infra.example.net @ SOA 3600 'ns1.infra.example.net. hostmaster.infra.example.net. 1 3600 600 1209600 300'
+sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin replace-rrset infra.example.net ns1 A 3600 192.0.2.53
+sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin list-zone infra.example.net
 sudo -u postgres pdnsutil --config-dir=/run/sinver-pdns-admin check-zone infra.example.net
 ```
 
-`--config-dir` выбирает каталог административной конфигурации. `create-zone` создаёт зону с SOA/NS, `set-kind` задаёт тип, `replace-rrset` заменяет указанный набор записей, `check-zone` проверяет структуру зоны. SOA здесь имеет SERIAL `1`, REFRESH `3600`, RETRY `600`, EXPIRE `1209600`, MINIMUM `300`; их смысл разобран в [главе «Зоны»](09_Zones_RU.md). DNSSEC в этом стенде не включается.
+`--config-dir` выбирает каталог административной конфигурации. `create-zone` создаёт зону с SOA/NS, `set-kind` задаёт тип, `replace-rrset` заменяет указанный набор записей, `list-zone` показывает итоговые записи, `check-zone` проверяет структуру зоны.
+
+В PowerDNS 4.7/4.8 аргумент `NAME` команды `replace-rrset` обрабатывается как имя относительно зоны. Поэтому для вершины зоны здесь используется `@`, а для `ns1.infra.example.net` — относительное имя `ns1`. Не подставляйте в эти две команды соответственно `infra.example.net` и `ns1.infra.example.net`: в PowerDNS 4.7.3/4.8.x это может создать записи вида `infra.example.net.infra.example.net` и `ns1.infra.example.net.infra.example.net`.
+
+В выводе `list-zone` должны присутствовать SOA и NS для `infra.example.net` и A-запись `ns1.infra.example.net`. Имен с повторяющимся суффиксом `.infra.example.net.infra.example.net` быть не должно. Только после этого переходите дальше.
+
+SOA здесь имеет SERIAL `1`, REFRESH `3600`, RETRY `600`, EXPIRE `1209600`, MINIMUM `300`; их смысл разобран в [главе «Зоны»](09_Zones_RU.md). DNSSEC в этом стенде не включается.
 
 После успешной проверки удалите временную административную конфигурацию и запустите PowerDNS:
 
@@ -394,7 +418,11 @@ psql -h 127.0.0.1 -U sinver_writer -d powerdns -W -c 'SELECT name, type FROM dom
 | PostgreSQL password | Пароль `sinver_writer` |
 | Description | `Тестовая зона` — необязательно |
 
-Завершающие точки у `MNAME` и `RNAME` позволяют также корректно использовать экспорт BIND9. Имя самой зоны должно в точности совпадать с `domains.name` в PostgreSQL.
+`MNAME` — имя основного авторитетного DNS-сервера, записываемое в SOA. Для этого тестового стенда это `ns1.infra.example.net.`. Это DNS-имя, а не IP-адрес и не адрес сервера SINVER/PostgreSQL.
+
+`RNAME` — контактный адрес администратора зоны в формате SOA: первая точка заменяет символ `@`. Например, `hostmaster.infra.example.net.` соответствует адресу `hostmaster@infra.example.net`.
+
+Завершающие точки у `MNAME` и `RNAME` обозначают абсолютные DNS-имена и позволяют также корректно использовать экспорт BIND9. Имя самой зоны должно в точности совпадать с `domains.name` в PostgreSQL.
 
 Создайте сервер на вкладке **Servers → Add server**:
 
@@ -472,6 +500,7 @@ psql -h 127.0.0.1 -U sinver_writer -d powerdns -W -c "SELECT name, type, content
 - [Certbot — плагин NGINX](https://eff-certbot.readthedocs.io/en/stable/using.html#nginx) и [продление сертификатов](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
 - [PowerDNS — PostgreSQL backend](https://doc.powerdns.com/authoritative/backends/generic-postgresql.html).
 - [PowerDNS 4.7 — pdnsutil](https://manpages.debian.org/bookworm/pdns-server/pdnsutil.1.en.html).
+- [PowerDNS #13420 — `replace-rrset` в 4.7/4.8 трактует имя записи как относительное](https://github.com/PowerDNS/pdns/issues/13420).
 - [Debian — установка PostgreSQL backend и путь схемы](https://sources.debian.org/src/pdns/4.7.3-2/debian/pdns-backend-pgsql.README.Debian/).
 - [PostgreSQL — GRANT](https://www.postgresql.org/docs/current/sql-grant.html), [SET ROLE](https://www.postgresql.org/docs/current/sql-set-role.html) и [параметры подключения libpq](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-PARAMKEYWORDS).
 
